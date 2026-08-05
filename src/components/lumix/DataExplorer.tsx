@@ -32,6 +32,7 @@ import {
   deleteMedia,
   fetchMedia,
   incrementViews,
+  restoreMedia,
   updateMedia,
   type ExplorerParams,
   type MediaRow,
@@ -160,14 +161,30 @@ export function DataExplorer({
     if (!removing) return;
     setDeleting(true);
     try {
-      await purge({
-        data: {
-          cloudflareUid: removing.cloudflare_uid,
-          cloudinaryPublicId: removing.cloudinary_public_id,
-        },
-      });
-      await deleteMedia(removing.id);
-      toast.success("Deleted from the database, image CDN and video CDN.");
+      // Delete the row first: it is the only step that can be rolled back.
+      const removed = await deleteMedia(removing.id);
+      try {
+        const result = await purge({
+          data: { videoUrl: removed.video_url, posterUrl: removed.poster_uri },
+        });
+        if (result.video.startsWith("failed") || result.poster.startsWith("failed")) {
+          toast.warning(
+            `Record deleted, but CDN cleanup was partial (video: ${result.video}, poster: ${result.poster}).`,
+          );
+        } else {
+          toast.success("Deleted from the database, image CDN and video CDN.");
+        }
+      } catch (cdnError) {
+        // Roll the database back so the row never loses its assets silently.
+        try {
+          await restoreMedia(removed);
+          toast.error(`Delete rolled back — CDN cleanup failed: ${(cdnError as Error).message}`);
+          setDeleting(false);
+          return;
+        } catch {
+          toast.warning("Record deleted, but its CDN files may need manual cleanup.");
+        }
+      }
       setRemoving(null);
       onMutated();
     } catch (error) {
@@ -176,6 +193,7 @@ export function DataExplorer({
       setDeleting(false);
     }
   };
+
 
   const preview = async (row: MediaRow) => {
     try {
@@ -304,7 +322,7 @@ export function DataExplorer({
               className="group relative w-24 shrink-0 overflow-hidden rounded-xl sm:w-36"
             >
               <img
-                src={row.poster_url}
+                src={row.poster_uri}
                 alt={row.title}
                 loading="lazy"
                 className="aspect-video size-full object-cover transition-transform duration-500 group-hover:scale-110"

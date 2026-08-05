@@ -44,10 +44,7 @@ type LiteRow = Awaited<ReturnType<typeof fetchAllMediaLite>>[number];
 
 function AdminDashboard() {
   const { loading, session, isAdmin } = useAuth();
-  //console.log("hhe",loading, session,'admin', isAdmin)
-  //const readConfig = useServerFn(getDeliveryConfig);
-
-  const readConfig = null as any;
+  const readConfig = useServerFn(getDeliveryConfig);
 
   const [rows, setRows] = useState<LiteRow[]>([]);
   const [stats, setStats] = useState<CategoryStat[]>([]);
@@ -62,8 +59,18 @@ function AdminDashboard() {
 
   useEffect(() => {
     if (!session || !isAdmin) return;
+    let cancelled = false;
     void load();
-   setReady(true);
+    void readConfig()
+      .then((config) => {
+        if (!cancelled) setReady(Boolean(config.r2Ready && config.cloudinaryReady));
+      })
+      .catch(() => {
+        if (!cancelled) setReady(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [session, isAdmin, load, readConfig, refreshToken]);
 
   if (loading) {

@@ -136,18 +136,18 @@ export function UploadWizard({
 
     setSubmitting(true);
     setStages({
-      poster: { pct: 0, state: "active", detail: "Requesting signed upload URLs…" },
-      video: { pct: 0, state: "idle" },
+      video: { pct: 0, state: "active", detail: "Requesting signed upload URLs…" },
+      poster: { pct: 0, state: "idle" },
       record: { pct: 0, state: "idle" },
     });
 
     let posterId: string | null = null;
+    let posterUrl: string | null = null;
     let videoKey: string | null = null;
 
     try {
-      // 1) Signed poster credentials (Cloudinary) + presigned video PUT (R2).
-      const [posterSign, ticket] = await Promise.all([
-        signPoster({ data: { posterSize: thumb.blob.size } }),
+      // 1) Presigned video PUT (R2) + signed poster credentials (Cloudinary).
+      const [ticket, posterSign] = await Promise.all([
         createTicket({
           data: {
             videoName: file.name,
@@ -155,47 +155,38 @@ export function UploadWizard({
             videoSize: file.size,
           },
         }),
+        signPoster({ data: { posterSize: thumb.blob.size } }),
       ]);
 
-      // 2) Poster → Cloudinary
-      setStage("poster", { detail: "Uploading poster to Cloudinary…" });
-
-      const poster = await uploadToCloudinary(
-        {
-          uploadUrl: posterSign.uploadUrl,
-          apiKey: posterSign.apiKey,
-          timestamp: posterSign.timestamp,
-          signature: posterSign.signature,
-          folder: posterSign.folder,
-        },
-        thumb.blob,
-        "poster.jpg",
-        (pct) => setStage("poster", { pct, detail: `Uploading poster… ${pct}%` }),
-      );
-
-
-      posterId = poster.publicId;
-      setStage("poster", { pct: 100, state: "done", detail: "Poster stored on Cloudinary." });
-
-      // 3) Video → R2 (streamed straight from the browser, real byte progress)
-      setStage("video", { state: "active", detail: "Starting transfer…" });
+      // 2) Video → R2 first: no poster is ever stored for a failed video upload.
+      setStage("video", { detail: "Starting transfer…" });
       await uploadToR2(ticket.videoUploadUrl, file, file.type || "video/mp4", (pct) =>
         setStage("video", { pct, detail: `${pct}% of ${formatBytes(file.size)} transferred` }),
       ).promise;
       videoKey = ticket.videoKey;
       setStage("video", { pct: 100, state: "done", detail: "Video stored on R2 + CDN." });
 
+      // 3) Poster → Cloudinary
+      setStage("poster", { state: "active", detail: "Uploading poster to Cloudinary…" });
+      const poster = await uploadToCloudinary(
+        posterSign,
+        thumb.blob,
+        "poster.jpg",
+        (pct) => setStage("poster", { pct, detail: `Uploading poster… ${pct}%` }),
+      ).promise;
+      posterId = poster.publicId;
+      posterUrl = poster.secureUrl;
+      setStage("poster", { pct: 100, state: "done", detail: "Poster stored on Cloudinary." });
+
       // 4) Persist the record
       setStage("record", { state: "active", pct: 40, detail: "Writing database record…" });
       await insertMedia({
         title: title.trim(),
         video_url: ticket.videoUrl,
-        poster_url: poster.secureUrl,
+        poster_uri: posterUrl,
         category: categories.join(", "),
         actors,
         duration_seconds: Math.max(1, Math.round(duration)),
-        cloudflare_uid: ticket.videoKey,
-        cloudinary_public_id: poster.publicId,
       });
       setStage("record", { pct: 100, state: "done", detail: "Saved." });
 
@@ -205,8 +196,8 @@ export function UploadWizard({
     } catch (error) {
       const message = (error as Error).message;
       setStages((prev) => ({
-        poster: prev.poster.state === "done" ? prev.poster : { ...prev.poster, state: "error" },
         video: prev.video.state === "done" ? prev.video : { ...prev.video, state: "error" },
+        poster: prev.poster.state === "done" ? prev.poster : { ...prev.poster, state: "error" },
         record: { ...prev.record, state: "error", detail: message },
       }));
 
@@ -221,10 +212,10 @@ export function UploadWizard({
         toast.error(`Upload failed: ${message}`);
       }
     } finally {
-
       setSubmitting(false);
     }
   };
+
 
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
@@ -411,8 +402,7 @@ export function UploadWizard({
 
           {!ready ? (
             <p className="glass text-destructive px-3 py-2 text-xs">
-              Cloudflare R2 storage keys are missing, so publishing is disabled. Add the R2
-              credentials to enable uploads.
+              Cloudflare R2 or Cloudinary credentials are missing, so publishing is disabled.
             </p>
           ) : null}
 
@@ -428,17 +418,17 @@ export function UploadWizard({
 
           <div className="space-y-2">
             <StageProgress
-              label="1 · Poster → Cloudinary"
-              pct={stages.poster.pct}
-              state={stages.poster.state}
-              detail={stages.poster.detail}
-            />
-            <StageProgress
-              label="2 · Video → Cloudflare R2"
+              label="1 · Video → Cloudflare R2"
               pct={stages.video.pct}
               state={stages.video.state}
               detail={stages.video.detail}
               tone="pink"
+            />
+            <StageProgress
+              label="2 · Poster → Cloudinary"
+              pct={stages.poster.pct}
+              state={stages.poster.state}
+              detail={stages.poster.detail}
             />
             <StageProgress
               label="3 · Database record"

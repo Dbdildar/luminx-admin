@@ -35,9 +35,6 @@ function createSupabaseClient() {
   const SUPABASE_PUBLISHABLE_KEY =
     import.meta.env['VITE_SUPABASE_PUBLISHABLE_KEY'];
 
-  console.log("SUPABASE_URL", SUPABASE_URL);
-  console.log("SUPABASE_KEY", SUPABASE_PUBLISHABLE_KEY);
-
   if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
     const missing = [
       ...(!SUPABASE_URL ? ['SUPABASE_URL'] : []),
@@ -62,12 +59,30 @@ function createSupabaseClient() {
 
 let _supabase: ReturnType<typeof createSupabaseClient> | undefined;
 
+function getSupabase() {
+  if (!_supabase) _supabase = createSupabaseClient();
+  return _supabase;
+}
+
 // Import the supabase client like this:
 // import { supabase } from "@/integrations/supabase/client";
 export const supabase = new Proxy({} as ReturnType<typeof createSupabaseClient>, {
-  get(_, prop, receiver) {
-    if (!_supabase) _supabase = createSupabaseClient();
-    return Reflect.get(_supabase, prop, receiver);
+  get(_target, prop) {
+    const client = getSupabase();
+    const value = Reflect.get(client, prop) as unknown;
+    // Methods must keep the real client as `this`, otherwise supabase-js
+    // private class fields blow up ("Cannot read private member").
+    return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(client) : value;
+  },
+  set(_target, prop, value) {
+    return Reflect.set(getSupabase(), prop, value);
+  },
+  has(_target, prop) {
+    return Reflect.has(getSupabase(), prop);
+  },
+  getPrototypeOf() {
+    return Reflect.getPrototypeOf(getSupabase());
   },
 });
+
 

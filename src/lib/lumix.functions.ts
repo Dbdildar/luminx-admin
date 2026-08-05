@@ -100,15 +100,25 @@ export const purgeAssets = createServerFn({ method: "POST" })
         videoKey: z.string().max(300).nullable().optional(),
         cloudflareUid: z.string().max(300).nullable().optional(),
         cloudinaryPublicId: z.string().max(300).nullable().optional(),
+        videoUrl: z.string().max(2000).nullable().optional(),
+        posterUrl: z.string().max(2000).nullable().optional(),
       })
       .parse(input ?? {}),
   )
   .handler(async ({ data }) => {
-    const videoKey = data.videoKey ?? data.cloudflareUid ?? null;
-    const posterId = data.cloudinaryPublicId ?? null;
+    const { r2KeyFromUrl, cloudinaryIdFromUrl } = await import("./asset-keys");
+    const { hydrateServerEnv: hydrate } = await import("./env.server");
+    hydrate();
+
+    const videoKey =
+      data.videoKey ??
+      data.cloudflareUid ??
+      r2KeyFromUrl(data.videoUrl, process.env["R2_PUBLIC_URL"] ?? undefined);
+    const posterId = data.cloudinaryPublicId ?? cloudinaryIdFromUrl(data.posterUrl);
 
     let video = "skipped";
     let poster = "skipped";
+
 
     if (videoKey) {
       try {

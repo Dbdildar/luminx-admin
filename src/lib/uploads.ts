@@ -42,36 +42,58 @@ export function uploadToR2(
   return { promise, abort: () => xhr.abort() };
 }
 
+export type CloudinarySignature = {
+  uploadUrl: string;
+  apiKey: string;
+  timestamp: number;
+  signature: string;
+  folder: string;
+};
+
+export type CloudinaryResult = { publicId: string; secureUrl: string };
 
 /** Direct-to-Cloudinary signed upload with byte-level progress. */
-export async function uploadToCloudinary(
-  config: { uploadUrl: string; apiKey: string; timestamp: number; signature: string; folder: string },
+export function uploadToCloudinary(
+  config: CloudinarySignature,
   file: Blob,
   filename: string,
-  onProgress?: (pct: number) => void,
-) {
-  const formData = new FormData();
-  formData.append("file", file, filename);
-  formData.append("api_key", config.apiKey);
-  formData.append("timestamp", String(config.timestamp));
-  formData.append("folder", config.folder);
-  formData.append("signature", config.signature);
+  onProgress?: ProgressFn,
+): { promise: Promise<CloudinaryResult>; abort: () => void } {
+  const form = new FormData();
+  form.append("file", file, filename);
+  form.append("api_key", config.apiKey);
+  form.append("timestamp", String(config.timestamp));
+  form.append("folder", config.folder);
+  form.append("signature", config.signature);
 
-  console.log("Uploading with:", {
-    api_key: config.apiKey,
-    timestamp: config.timestamp,
-    folder: config.folder,
-    signature: config.signature,
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise<CloudinaryResult>((resolve, reject) => {
+    xhr.open("POST", config.uploadUrl, true);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onProgress?.(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      let payload: { public_id?: string; secure_url?: string; error?: { message?: string } } = {};
+      try {
+        payload = JSON.parse(xhr.responseText) as typeof payload;
+      } catch {
+        /* handled below */
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && payload.public_id && payload.secure_url) {
+        onProgress?.(100);
+        resolve({ publicId: payload.public_id, secureUrl: payload.secure_url });
+      } else {
+        reject(
+          new Error(
+            payload.error?.message ?? `Cloudinary rejected the poster upload (${xhr.status}).`,
+          ),
+        );
+      }
+    };
+    xhr.onerror = () => reject(new Error("Network error while uploading the poster to Cloudinary."));
+    xhr.onabort = () => reject(new Error("Poster upload cancelled."));
+    xhr.send(form);
   });
 
-  const res = await fetch(config.uploadUrl, {
-    method: "POST",
-    body: formData,
-  });
-
-  if (!res.ok) {
-    throw new Error(`Cloudinary upload failed: ${res.statusText}`);
-  }
-
-  return res.json();
+  return { promise, abort: () => xhr.abort() };
 }
