@@ -1,7 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
 /**
  * Split delivery:
@@ -24,7 +23,9 @@ async function sha1Hex(value: string): Promise<string> {
     .join("");
 }
 
-function cloudinaryEnv() {
+async function cloudinaryEnv() {
+  const { hydrateServerEnv } = await import("./env.server");
+  hydrateServerEnv();
   const cloudName = process.env["CLOUDINARY_CLOUD_NAME"];
   const apiKey = process.env["CLOUDINARY_API_KEY"];
   const apiSecret = process.env["CLOUDINARY_API_SECRET"];
@@ -36,14 +37,13 @@ function cloudinaryEnv() {
 
 /** Signed params for a direct browser -> Cloudinary poster upload. */
 export const signPosterUpload = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
     z
       .object({ posterSize: z.number().int().positive().max(MAX_POSTER_BYTES) })
       .parse(input ?? { posterSize: 1 }),
   )
   .handler(async () => {
-    const { cloudName, apiKey, apiSecret } = cloudinaryEnv();
+    const { cloudName, apiKey, apiSecret } = await cloudinaryEnv();
    
     const timestamp = Math.floor(Date.now() / 1000);
 
@@ -64,7 +64,6 @@ export const signPosterUpload = createServerFn({ method: "POST" })
 
 /** Presigned PUT for the video object on R2. */
 export const createUploadTicket = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
@@ -77,6 +76,8 @@ export const createUploadTicket = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     if (!data.videoType.startsWith("video/")) throw new Error("Only video files are accepted.");
 
+    const { hydrateServerEnv } = await import("./env.server");
+    hydrateServerEnv();
     const { r2Env, presignR2, buildObjectKey, publicUrlFor } = await import("./r2.server");
     const env = r2Env();
 
@@ -93,7 +94,6 @@ export const createUploadTicket = createServerFn({ method: "POST" })
 
 /** Best-effort cleanup used by rollback and by record deletion. */
 export const purgeAssets = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
     z
       .object({
@@ -112,6 +112,8 @@ export const purgeAssets = createServerFn({ method: "POST" })
 
     if (videoKey) {
       try {
+        const { hydrateServerEnv } = await import("./env.server");
+        hydrateServerEnv();
         const { r2Env, deleteR2Object } = await import("./r2.server");
         video = (await deleteR2Object(r2Env(), videoKey)) ? "deleted" : "failed";
       } catch (error) {
@@ -121,7 +123,7 @@ export const purgeAssets = createServerFn({ method: "POST" })
 
     if (posterId) {
       try {
-        const { cloudName, apiKey, apiSecret } = cloudinaryEnv();
+        const { cloudName, apiKey, apiSecret } = await cloudinaryEnv();
 
         const timestamp = Math.floor(Date.now() / 1000);
 
@@ -155,6 +157,8 @@ export const purgeAssets = createServerFn({ method: "POST" })
 
 /** Lets the UI warn before a user wastes an upload. */
 export const getDeliveryConfig = createServerFn({ method: "GET" }).handler(async () => {
+  const { hydrateServerEnv } = await import("./env.server");
+  hydrateServerEnv();
   const { r2Configured } = await import("./r2.server");
   const r2Ready = r2Configured();
   const cloudinaryReady = Boolean(

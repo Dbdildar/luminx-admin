@@ -394,14 +394,14 @@ export function DataExplorer({
       ) : null}
 
       <Dialog open={Boolean(editing)} onOpenChange={(open) => (open ? null : setEditing(null))}>
-        <DialogContent className="glass max-w-lg">
-          <DialogHeader>
+        <DialogContent className="glass flex max-h-[92dvh] w-[calc(100vw-1.5rem)] max-w-lg flex-col gap-0 overflow-hidden p-0 sm:w-full">
+          <DialogHeader className="shrink-0 border-b border-white/10 p-4 text-left sm:p-6">
             <DialogTitle>Edit record</DialogTitle>
             <DialogDescription>
               Metadata updates apply instantly; media files stay on the CDN.
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-4">
+          <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4 sm:p-6">
             <div className="space-y-2">
               <Label htmlFor="edit-title">Title</Label>
               <Input
@@ -441,14 +441,19 @@ export function DataExplorer({
               />
             </div>
           </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setEditing(null)} disabled={saving}>
+          <DialogFooter className="shrink-0 flex-col-reverse gap-2 border-t border-white/10 bg-background/40 p-4 sm:flex-row sm:justify-end sm:p-6">
+            <Button
+              variant="ghost"
+              onClick={() => setEditing(null)}
+              disabled={saving}
+              className="w-full sm:w-auto"
+            >
               Cancel
             </Button>
             <Button
               onClick={() => void saveEdit()}
               disabled={saving}
-              className="bg-gradient-cyan text-primary-foreground glow-cyan spring-press font-semibold"
+              className="bg-gradient-cyan text-primary-foreground glow-cyan spring-press w-full font-semibold sm:w-auto"
             >
               {saving ? "Saving…" : "Save changes"}
             </Button>
@@ -456,24 +461,30 @@ export function DataExplorer({
         </DialogContent>
       </Dialog>
 
+
       <Dialog open={Boolean(removing)} onOpenChange={(open) => (open ? null : setRemoving(null))}>
-        <DialogContent className="glass max-w-md">
-          <DialogHeader>
+        <DialogContent className="glass w-[calc(100vw-1.5rem)] max-w-md sm:w-full">
+          <DialogHeader className="text-left">
             <DialogTitle>Delete permanently?</DialogTitle>
             <DialogDescription>
               “{removing?.title}” will be removed from the database, the image CDN and the video
               CDN. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setRemoving(null)} disabled={deleting}>
+          <DialogFooter className="flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+            <Button
+              variant="ghost"
+              onClick={() => setRemoving(null)}
+              disabled={deleting}
+              className="w-full sm:w-auto"
+            >
               Keep it
             </Button>
             <Button
               variant="destructive"
               onClick={() => void confirmDelete()}
               disabled={deleting}
-              className="spring-press"
+              className="spring-press w-full sm:w-auto"
             >
               {deleting ? "Deleting…" : "Delete everywhere"}
             </Button>
@@ -483,3 +494,4 @@ export function DataExplorer({
     </GlassPanel>
   );
 }
+

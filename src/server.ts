@@ -1,4 +1,7 @@
+import "./lib/env.server";
 import "./lib/error-capture";
+
+import { hydrateServerEnv } from "./lib/env.server";
 
 import { consumeLastCapturedError } from "./lib/error-capture";
 import { renderErrorPage } from "./lib/error-page";
@@ -46,6 +49,7 @@ function isH3SwallowedErrorBody(body: string): boolean {
 
 export default {
   async fetch(request: Request, env: unknown, ctx: unknown) {
+    hydrateServerEnv(env as Record<string, unknown> | undefined);
     try {
       const handler = await getServerEntry();
       const response = await handler.fetch(request, env, ctx);
