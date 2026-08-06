@@ -97,3 +97,111 @@ export function uploadToCloudinary(
 
   return { promise, abort: () => xhr.abort() };
 }
+
+/* ------------------------------------------------------------------ *
+ * Parallel multipart upload to R2 — several parts in flight at once,  *
+ * which is dramatically faster than one sequential PUT for big files. *
+ * ------------------------------------------------------------------ */
+
+export const MULTIPART_THRESHOLD = 16 * 1024 * 1024; // below this a single PUT wins
+
+/** Part size grows with the file so we never exceed 10k parts. */
+export function pickPartSize(size: number): number {
+  const min = 8 * 1024 * 1024;
+  return Math.max(min, Math.ceil(size / 9000 / min) * min);
+}
+
+function putPart(
+  url: string,
+  body: Blob,
+  onBytes: (loaded: number) => void,
+  signal: { aborted: boolean; register: (abort: () => void) => void },
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    signal.register(() => xhr.abort());
+    xhr.open("PUT", url, true);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) onBytes(event.loaded);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const etag = xhr.getResponseHeader("ETag");
+        if (!etag) {
+          reject(new Error("R2 did not expose the ETag header — add ETag to the bucket CORS ExposeHeaders."));
+          return;
+        }
+        onBytes(body.size);
+        resolve(etag);
+      } else {
+        reject(new Error(`Part upload failed (${xhr.status}). ${xhr.responseText || ""}`.trim()));
+      }
+    };
+    xhr.onerror = () =>
+      reject(new Error("Network error during upload. Check the R2 bucket CORS rules for this origin."));
+    xhr.onabort = () => reject(new Error("Upload cancelled."));
+    xhr.send(body);
+  });
+}
+
+/** Uploads all parts with a bounded concurrency pool, retrying transient failures. */
+export async function uploadPartsInParallel(options: {
+  file: Blob;
+  partUrls: string[];
+  partSize: number;
+  concurrency?: number;
+  onProgress?: (pct: number, bytesPerSecond: number) => void;
+}): Promise<{ partNumber: number; etag: string }[]> {
+  const { file, partUrls, partSize } = options;
+  const concurrency = Math.min(options.concurrency ?? 4, partUrls.length);
+  const loaded = new Array<number>(partUrls.length).fill(0);
+  const started = performance.now();
+  const aborts: (() => void)[] = [];
+  const state = { aborted: false, register: (a: () => void) => aborts.push(a) };
+  const results: { partNumber: number; etag: string }[] = [];
+
+  const report = () => {
+    const total = loaded.reduce((a, b) => a + b, 0);
+    const seconds = Math.max(0.001, (performance.now() - started) / 1000);
+    options.onProgress?.(Math.min(99, Math.round((total / file.size) * 100)), total / seconds);
+  };
+
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const index = next++;
+      if (index >= partUrls.length) return;
+      const start = index * partSize;
+      const chunk = file.slice(start, Math.min(start + partSize, file.size));
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const etag = await putPart(
+            partUrls[index]!,
+            chunk,
+            (bytes) => {
+              loaded[index] = bytes;
+              report();
+            },
+            state,
+          );
+          results.push({ partNumber: index + 1, etag });
+          lastError = undefined;
+          break;
+        } catch (error) {
+          lastError = error;
+          loaded[index] = 0;
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+        }
+      }
+      if (lastError) {
+        aborts.forEach((a) => a());
+        throw lastError;
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  options.onProgress?.(100, file.size / Math.max(0.001, (performance.now() - started) / 1000));
+  return results;
+}

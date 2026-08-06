@@ -178,3 +178,73 @@ export const getDeliveryConfig = createServerFn({ method: "GET" }).handler(async
   );
   return { r2Ready, cloudinaryReady, cloudflareReady: r2Ready };
 });
+
+/* ---------------- Multipart (parallel) video upload ---------------- */
+
+/** Opens a multipart upload and hands back presigned URLs for every part. */
+export const createMultipartTicket = createServerFn({ method: "POST" })
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        videoName: z.string().min(1).max(200),
+        videoType: z.string().min(3).max(100),
+        videoSize: z.number().int().positive().max(MAX_VIDEO_BYTES),
+        partCount: z.number().int().positive().max(10000),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data }) => {
+    if (!data.videoType.startsWith("video/")) throw new Error("Only video files are accepted.");
+    const { hydrateServerEnv } = await import("./env.server");
+    hydrateServerEnv();
+    const mod = await import("./r2.server");
+    const env = mod.r2Env();
+    const videoKey = mod.buildObjectKey("videos", data.videoName);
+    const uploadId = await mod.createMultipartUpload(env, videoKey, data.videoType);
+    const partUrls = await mod.presignParts(
+      env,
+      videoKey,
+      uploadId,
+      Array.from({ length: data.partCount }, (_, i) => i + 1),
+    );
+    return { videoKey, uploadId, partUrls, videoUrl: mod.publicUrlFor(env, videoKey) };
+  });
+
+export const completeMultipartTicket = createServerFn({ method: "POST" })
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        videoKey: z.string().min(1).max(300),
+        uploadId: z.string().min(1).max(400),
+        parts: z
+          .array(z.object({ partNumber: z.number().int().positive(), etag: z.string().min(1) }))
+          .min(1),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data }) => {
+    const { hydrateServerEnv } = await import("./env.server");
+    hydrateServerEnv();
+    const mod = await import("./r2.server");
+    const env = mod.r2Env();
+    await mod.completeMultipartUpload(env, data.videoKey, data.uploadId, data.parts);
+    return { ok: true, videoUrl: mod.publicUrlFor(env, data.videoKey) };
+  });
+
+export const abortMultipartTicket = createServerFn({ method: "POST" })
+  .inputValidator((input: unknown) =>
+    z
+      .object({ videoKey: z.string().min(1).max(300), uploadId: z.string().min(1).max(400) })
+      .parse(input),
+  )
+  .handler(async ({ data }) => {
+    try {
+      const { hydrateServerEnv } = await import("./env.server");
+    hydrateServerEnv();
+    const mod = await import("./r2.server");
+    const env = mod.r2Env();
+      return { aborted: await mod.abortMultipartUpload(env, data.videoKey, data.uploadId) };
+    } catch {
+      return { aborted: false };
+    }
+  });

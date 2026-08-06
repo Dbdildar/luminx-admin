@@ -96,8 +96,10 @@ async function signingKey(env: R2Env, short: string): Promise<ArrayBuffer> {
 export async function presignR2(options: {
   env: R2Env;
   key: string;
-  method: "PUT" | "GET" | "DELETE";
+  method: "PUT" | "GET" | "DELETE" | "POST";
   expiresIn?: number;
+  /** Extra query params folded into the signature (multipart uses these). */
+  query?: Record<string, string>;
 }): Promise<string> {
   const { env, key, method } = options;
   const expires = Math.min(Math.max(options.expiresIn ?? 3600, 60), 7 * 24 * 3600);
@@ -107,12 +109,14 @@ export async function presignR2(options: {
   const credential = `${env.accessKeyId}/${short}/auto/s3/aws4_request`;
 
   const params: [string, string][] = [
+    ...Object.entries(options.query ?? {}),
     ["X-Amz-Algorithm", "AWS4-HMAC-SHA256"],
     ["X-Amz-Credential", credential],
     ["X-Amz-Date", amz],
     ["X-Amz-Expires", String(expires)],
     ["X-Amz-SignedHeaders", "host"],
   ];
+
   const canonicalQuery = params
     .map(([k, v]) => [uriEncode(k), uriEncode(v)] as const)
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
@@ -161,4 +165,77 @@ export function buildObjectKey(prefix: string, fileName: string): string {
   const stamp = Date.now().toString(36);
   const rand = crypto.randomUUID().slice(0, 8);
   return `${prefix}/${stamp}-${rand}-${clean || "file"}.${ext}`;
+}
+
+/* ------------------------------------------------------------------ *
+ * Multipart upload (parallel part transfer = much faster big uploads) *
+ * ------------------------------------------------------------------ */
+
+function xmlValue(xml: string, tag: string): string | null {
+  const match = new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`).exec(xml);
+  return match?.[1]?.trim() ?? null;
+}
+
+/** Starts a multipart upload and returns its uploadId. */
+export async function createMultipartUpload(
+  env: R2Env,
+  key: string,
+  contentType: string,
+): Promise<string> {
+  const url = await presignR2({ env, key, method: "POST", expiresIn: 600, query: { uploads: "" } });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": contentType } });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`R2 refused to start the upload (${res.status}). ${text.slice(0, 200)}`);
+  const uploadId = xmlValue(text, "UploadId");
+  if (!uploadId) throw new Error("R2 did not return an upload id.");
+  return uploadId;
+}
+
+/** Presigned PUT URLs, one per part, that the browser uploads in parallel. */
+export async function presignParts(
+  env: R2Env,
+  key: string,
+  uploadId: string,
+  partNumbers: number[],
+): Promise<string[]> {
+  return Promise.all(
+    partNumbers.map((partNumber) =>
+      presignR2({
+        env,
+        key,
+        method: "PUT",
+        expiresIn: 6 * 3600,
+        query: { partNumber: String(partNumber), uploadId },
+      }),
+    ),
+  );
+}
+
+export async function completeMultipartUpload(
+  env: R2Env,
+  key: string,
+  uploadId: string,
+  parts: { partNumber: number; etag: string }[],
+): Promise<void> {
+  const body = `<CompleteMultipartUpload>${parts
+    .slice()
+    .sort((a, b) => a.partNumber - b.partNumber)
+    .map(
+      (p) =>
+        `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${p.etag.replace(/"/g, "&quot;")}</ETag></Part>`,
+    )
+    .join("")}</CompleteMultipartUpload>`;
+
+  const url = await presignR2({ env, key, method: "POST", expiresIn: 900, query: { uploadId } });
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/xml" }, body });
+  const text = await res.text();
+  if (!res.ok || text.includes("<Error>")) {
+    throw new Error(`R2 could not finalise the upload (${res.status}). ${text.slice(0, 200)}`);
+  }
+}
+
+export async function abortMultipartUpload(env: R2Env, key: string, uploadId: string): Promise<boolean> {
+  const url = await presignR2({ env, key, method: "DELETE", expiresIn: 300, query: { uploadId } });
+  const res = await fetch(url, { method: "DELETE" });
+  return res.ok || res.status === 404;
 }

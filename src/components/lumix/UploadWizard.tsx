@@ -7,9 +7,23 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { createUploadTicket, purgeAssets, signPosterUpload } from "@/lib/lumix.functions";
+import {
+  abortMultipartTicket,
+  completeMultipartTicket,
+  createMultipartTicket,
+  createUploadTicket,
+  purgeAssets,
+  signPosterUpload,
+} from "@/lib/lumix.functions";
 import { extractThumbnails, formatBytes, formatDuration, probeVideo, type Thumbnail } from "@/lib/media";
-import { uploadToCloudinary, uploadToR2 } from "@/lib/uploads";
+import {
+  MULTIPART_THRESHOLD,
+  pickPartSize,
+  uploadPartsInParallel,
+  uploadToCloudinary,
+  uploadToR2,
+} from "@/lib/uploads";
+import { compressVideo } from "@/lib/compress";
 import { insertMedia } from "@/lib/lumix-data";
 import { CategoryPicker } from "./CategoryPicker";
 import { TagPicker } from "./TagPicker";
@@ -17,16 +31,19 @@ import { GlassPanel, SectionHeading } from "./GlassPanel";
 import { StageProgress, type StageState } from "./StageProgress";
 
 type Stages = {
+  compress: { pct: number; state: StageState; detail?: string };
   poster: { pct: number; state: StageState; detail?: string };
   video: { pct: number; state: StageState; detail?: string };
   record: { pct: number; state: StageState; detail?: string };
 };
 
 const initialStages: Stages = {
+  compress: { pct: 0, state: "idle" },
   poster: { pct: 0, state: "idle" },
   video: { pct: 0, state: "idle" },
   record: { pct: 0, state: "idle" },
 };
+
 
 export function UploadWizard({
   categorySuggestions,
@@ -40,8 +57,12 @@ export function UploadWizard({
   onCreated: () => void;
 }) {
   const createTicket = useServerFn(createUploadTicket);
+  const createMultipart = useServerFn(createMultipartTicket);
+  const completeMultipart = useServerFn(completeMultipartTicket);
+  const abortMultipart = useServerFn(abortMultipartTicket);
   const purge = useServerFn(purgeAssets);
   const signPoster = useServerFn(signPosterUpload);
+
 
   const inputRef = useRef<HTMLInputElement | null>(null);
   const thumbsRef = useRef<Thumbnail[]>([]);
@@ -136,7 +157,8 @@ export function UploadWizard({
 
     setSubmitting(true);
     setStages({
-      video: { pct: 0, state: "active", detail: "Requesting signed upload URLs…" },
+      compress: { pct: 0, state: "active", detail: "Preparing video…" },
+      video: { pct: 0, state: "idle" },
       poster: { pct: 0, state: "idle" },
       record: { pct: 0, state: "idle" },
     });
@@ -144,30 +166,79 @@ export function UploadWizard({
     let posterId: string | null = null;
     let posterUrl: string | null = null;
     let videoKey: string | null = null;
+    let multipart: { videoKey: string; uploadId: string } | null = null;
 
     try {
-      // 1) Presigned video PUT (R2) + signed poster credentials (Cloudinary).
-      const [ticket, posterSign] = await Promise.all([
-        createTicket({
-          data: {
-            videoName: file.name,
-            videoType: file.type || "video/mp4",
-            videoSize: file.size,
-          },
-        }),
-        signPoster({ data: { posterSize: thumb.blob.size } }),
-      ]);
+      // 1) Compress locally (hardware encoder). Falls back to the original file.
+      const result = await compressVideo(file, (pct) =>
+        setStage("compress", { pct, detail: `Re-encoding… ${pct}%` }),
+      );
+      const upload = result.file;
+      setStage("compress", {
+        pct: 100,
+        state: "done",
+        detail: result.compressed
+          ? `${formatBytes(result.originalSize)} → ${formatBytes(result.finalSize)} (−${Math.round(
+              (1 - result.finalSize / result.originalSize) * 100,
+            )}%)`
+          : (result.reason ?? "Uploading the original file."),
+      });
+
+      const contentType = upload.type || "video/mp4";
+      setStage("video", { state: "active", detail: "Requesting signed upload URLs…" });
+
+      const posterSignPromise = signPoster({ data: { posterSize: thumb.blob.size } });
+      let videoUrl: string;
 
       // 2) Video → R2 first: no poster is ever stored for a failed video upload.
-      setStage("video", { detail: "Starting transfer…" });
-      await uploadToR2(ticket.videoUploadUrl, file, file.type || "video/mp4", (pct) =>
-        setStage("video", { pct, detail: `${pct}% of ${formatBytes(file.size)} transferred` }),
-      ).promise;
-      videoKey = ticket.videoKey;
+      if (upload.size > MULTIPART_THRESHOLD) {
+        // Parallel multipart transfer — many chunks in flight at once.
+        const partSize = pickPartSize(upload.size);
+        const partCount = Math.ceil(upload.size / partSize);
+        const ticket = await createMultipart({
+          data: {
+            videoName: upload.name,
+            videoType: contentType,
+            videoSize: upload.size,
+            partCount,
+          },
+        });
+        multipart = { videoKey: ticket.videoKey, uploadId: ticket.uploadId };
+
+        const parts = await uploadPartsInParallel({
+          file: upload,
+          partUrls: ticket.partUrls,
+          partSize,
+          concurrency: 6,
+          onProgress: (pct, bps) =>
+            setStage("video", {
+              pct,
+              detail: `${pct}% of ${formatBytes(upload.size)} · ${formatBytes(bps)}/s · ${partCount} chunks in parallel`,
+            }),
+        });
+
+        setStage("video", { pct: 99, detail: "Finalising object on R2…" });
+        await completeMultipart({
+          data: { videoKey: ticket.videoKey, uploadId: ticket.uploadId, parts },
+        });
+        multipart = null;
+        videoKey = ticket.videoKey;
+        videoUrl = ticket.videoUrl;
+      } else {
+        const ticket = await createTicket({
+          data: { videoName: upload.name, videoType: contentType, videoSize: upload.size },
+        });
+        await uploadToR2(ticket.videoUploadUrl, upload, contentType, (pct) =>
+          setStage("video", { pct, detail: `${pct}% of ${formatBytes(upload.size)} transferred` }),
+        ).promise;
+        videoKey = ticket.videoKey;
+        videoUrl = ticket.videoUrl;
+      }
       setStage("video", { pct: 100, state: "done", detail: "Video stored on R2 + CDN." });
 
       // 3) Poster → Cloudinary
       setStage("poster", { state: "active", detail: "Uploading poster to Cloudinary…" });
+      const posterSign = await posterSignPromise;
       const poster = await uploadToCloudinary(
         posterSign,
         thumb.blob,
@@ -182,7 +253,7 @@ export function UploadWizard({
       setStage("record", { state: "active", pct: 40, detail: "Writing database record…" });
       await insertMedia({
         title: title.trim(),
-        video_url: ticket.videoUrl,
+        video_url: videoUrl,
         poster_uri: posterUrl,
         category: categories.join(", "),
         actors,
@@ -196,10 +267,20 @@ export function UploadWizard({
     } catch (error) {
       const message = (error as Error).message;
       setStages((prev) => ({
+        compress: prev.compress.state === "done" ? prev.compress : { ...prev.compress, state: "error" },
         video: prev.video.state === "done" ? prev.video : { ...prev.video, state: "error" },
         poster: prev.poster.state === "done" ? prev.poster : { ...prev.poster, state: "error" },
         record: { ...prev.record, state: "error", detail: message },
       }));
+
+      // Abandon a half-finished multipart upload so R2 keeps no orphan chunks.
+      if (multipart) {
+        try {
+          await abortMultipart({ data: multipart });
+        } catch {
+          /* best effort */
+        }
+      }
 
       if (videoKey || posterId) {
         try {
@@ -215,6 +296,7 @@ export function UploadWizard({
       setSubmitting(false);
     }
   };
+
 
 
   return (
@@ -418,25 +500,33 @@ export function UploadWizard({
 
           <div className="space-y-2">
             <StageProgress
-              label="1 · Video → Cloudflare R2"
+              label="1 · Smart compression (on-device)"
+              pct={stages.compress.pct}
+              state={stages.compress.state}
+              detail={stages.compress.detail}
+            />
+            <StageProgress
+              label="2 · Video → Cloudflare R2 (parallel chunks)"
               pct={stages.video.pct}
               state={stages.video.state}
               detail={stages.video.detail}
               tone="pink"
             />
+
             <StageProgress
-              label="2 · Poster → Cloudinary"
+              label="3 · Poster → Cloudinary"
               pct={stages.poster.pct}
               state={stages.poster.state}
               detail={stages.poster.detail}
             />
             <StageProgress
-              label="3 · Database record"
+              label="4 · Database record"
               pct={stages.record.pct}
               state={stages.record.state}
               detail={stages.record.detail}
               tone="emerald"
             />
+
           </div>
         </div>
       </GlassPanel>
